@@ -1,8 +1,12 @@
 # VEML7700 RP2040 console
 
 An Embassy-based RP2040 firmware crate for bringing up a VEML7700 ambient
-light sensor. It exposes a USB CDC serial console and uses I2C0 on GP4 (SDA)
-and GP5 (SCL).
+light sensor. It exposes a USB CDC serial console, uses I2C0 on GP4 (SDA) and
+GP5 (SCL), and accesses the sensor through the async
+[`ph-veml7700-als`](https://github.com/photon-circus/ph-veml7700-als) driver.
+
+The unpublished driver dependency is pinned to an exact Git revision. Building
+therefore requires GitHub credentials with access to the private repository.
 
 ## Wiring
 
@@ -41,4 +45,6 @@ elf2uf2-rs target/thumbv6m-none-eabi/release/veml7700-console veml7700-console.u
 ```
 
 Connect to the USB CDC serial port and enter `help` to list the console
-commands.
+commands. The `read` and `stream` commands perform controlled one-shot captures
+using the driver's maximum-range starting configuration and report its nominal
+integer illuminance in millilux.

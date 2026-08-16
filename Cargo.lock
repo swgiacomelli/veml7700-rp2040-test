@@ -913,6 +913,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ph-veml7700-als"
+version = "0.1.0-incubating.1"
+source = "git+https://github.com/photon-circus/ph-veml7700-als?rev=6996c2ff3151f1cff436177c140739cad11a4b31#6996c2ff3151f1cff436177c140739cad11a4b31"
+dependencies = [
+ "embedded-hal-async",
+]
+
+[[package]]
 name = "phf_shared"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1411,6 +1419,7 @@ dependencies = [
  "embedded-hal-async",
  "heapless",
  "panic-halt",
+ "ph-veml7700-als",
  "portable-atomic",
  "static_cell",
 ]

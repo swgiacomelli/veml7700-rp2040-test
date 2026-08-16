@@ -1,6 +1,13 @@
 [build]
 target = "thumbv6m-none-eabi"
 
+[net]
+git-fetch-with-cli = true
+
 [target.thumbv6m-none-eabi]
-rustflags = ["-C", "link-arg=-Tlink.x"]
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tlink-rp.x",
+]
 runner = "elf2uf2-rs -d"

@@ -4,8 +4,7 @@
 //! RP2040 + VEML7700 bring-up: USB CDC console over the native USB port,
 //! I2C0 on GP4 (SDA) / GP5 (SCL).
 //!
-//! Raw register access is used here deliberately so this is independent of
-//! any driver crate — swap `sensor::*` for your own driver once it lands.
+//! Sensor access is provided by the async `ph-veml7700-als` driver.
 //!
 //! Console commands (CR or LF terminated):
 //!   help          list commands
@@ -23,13 +22,14 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::i2c::{self, Async, I2c};
 use embassy_rp::peripherals::{I2C0, USB};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbIrq};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Delay, Duration, Timer};
 use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embedded_hal_async::i2c::I2c as _;
 use heapless::String;
 use panic_halt as _;
+use ph_veml7700_als::{MeasurementConfig, Veml7700};
 use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
@@ -37,43 +37,7 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbIrq<USB>;
 });
 
-// ---------------------------------------------------------------------------
-// VEML7700 register-level bits (datasheet + app note DS 84286)
-// ---------------------------------------------------------------------------
-mod sensor {
-    pub const ADDR: u8 = 0x10; // fixed, no address pins
-
-    pub const REG_ALS_CONF: u8 = 0x00;
-    pub const REG_POWER_SAVING: u8 = 0x03;
-    pub const REG_ALS: u8 = 0x04;
-    pub const REG_WHITE: u8 = 0x05;
-    pub const REG_ID: u8 = 0x07; // low byte reads 0x81
-
-    /// gain x1/8, IT 100 ms, persistence 1, INT off, powered on.
-    /// Widest dynamic range — the sane default for an unknown light level.
-    pub const CONF_STARTUP: u16 = 0b10 << 11;
-
-    /// lux per count for gain x1/8 @ 100 ms integration.
-    pub const RESOLUTION: f32 = 0.2304;
-}
-
-/// 16-bit registers are little-endian: [cmd, lsb, msb].
-async fn reg_write(
-    bus: &mut I2c<'static, I2C0, Async>,
-    reg: u8,
-    val: u16,
-) -> Result<(), i2c::Error> {
-    bus.write(sensor::ADDR, &[reg, val as u8, (val >> 8) as u8])
-        .await
-}
-
-async fn reg_read(bus: &mut I2c<'static, I2C0, Async>, reg: u8) -> Result<u16, i2c::Error> {
-    let mut buf = [0u8; 2];
-    bus.write_read(sensor::ADDR, &[reg], &mut buf).await?;
-    Ok(u16::from_le_bytes(buf))
-}
-
-// ---------------------------------------------------------------------------
+const MEASUREMENT_CONFIG: MeasurementConfig = MeasurementConfig::maximum_range_start();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -111,12 +75,6 @@ async fn main(spawner: Spawner) {
     let mut class = CdcAcmClass::new(&mut builder, CDC_STATE.init(State::new()), 64);
     let usb = builder.build();
     spawner.must_spawn(usb_task(usb));
-
-    // ---- Sensor power-on. Datasheet asks for >=2.5 ms after the shutdown bit
-    // clears, plus one full integration period before the first valid sample.
-    let _ = reg_write(&mut bus, sensor::REG_POWER_SAVING, 0x0000).await;
-    let _ = reg_write(&mut bus, sensor::REG_ALS_CONF, sensor::CONF_STARTUP).await;
-    Timer::after(Duration::from_millis(150)).await;
 
     loop {
         class.wait_connection().await;
@@ -207,9 +165,16 @@ async fn dispatch(
             write_str(class, "scan done\r\n").await?;
         }
         "id" => {
-            match reg_read(bus, sensor::REG_ID).await {
-                Ok(v) => {
-                    let _ = write!(out, "id = 0x{:04x} (low byte should be 0x81)\r\n", v);
+            let mut sensor = Veml7700::new(&mut *bus);
+            match sensor.read_device_id().await {
+                Ok(id) => {
+                    let _ = write!(
+                        out,
+                        "id=0x{:04x} device_code=0x{:02x} supported={}\r\n",
+                        id.raw(),
+                        id.device_code(),
+                        id.is_supported()
+                    );
                 }
                 Err(_) => {
                     let _ = write!(out, "i2c error reading id\r\n");
@@ -218,15 +183,16 @@ async fn dispatch(
             write_str(class, &out).await?;
         }
         "conf" => {
-            match reg_read(bus, sensor::REG_ALS_CONF).await {
-                Ok(v) => {
-                    let gain = (v >> 11) & 0b11;
-                    let it = (v >> 6) & 0b1111;
-                    let sd = v & 1;
+            let mut sensor = Veml7700::new(&mut *bus);
+            match sensor.read_configuration().await {
+                Ok(config) => {
                     let _ = write!(
                         out,
-                        "conf = 0x{:04x}  gain_bits={:02b} it_bits={:04b} shutdown={}\r\n",
-                        v, gain, it, sd
+                        "gain={:?} integration={}ms power={:?} monitor={:?}\r\n",
+                        config.measurement.gain(),
+                        config.measurement.integration_time().milliseconds(),
+                        config.power_state,
+                        config.threshold_monitor
                     );
                 }
                 Err(_) => {
@@ -236,15 +202,16 @@ async fn dispatch(
             write_str(class, &out).await?;
         }
         "read" => {
-            let als = reg_read(bus, sensor::REG_ALS).await;
-            let white = reg_read(bus, sensor::REG_WHITE).await;
-            match (als, white) {
-                (Ok(a), Ok(w)) => {
-                    let lux = a as f32 * sensor::RESOLUTION;
+            let mut sensor = Veml7700::new(&mut *bus);
+            let mut delay = Delay;
+            match sensor.measure_once(&mut delay, MEASUREMENT_CONFIG).await {
+                Ok(measurement) => {
                     let _ = write!(
                         out,
-                        "als={:5}  white={:5}  ~{} lux (uncorrected)\r\n",
-                        a, w, lux as u32
+                        "als={:5} white={:5} nominal={} mLux\r\n",
+                        measurement.als.counts(),
+                        measurement.white.counts(),
+                        measurement.nominal_illuminance.milli_lux_rounded()
                     );
                 }
                 _ => {
@@ -261,13 +228,15 @@ async fn dispatch(
                 match select(tick, class.read_packet(&mut sink)).await {
                     Either::First(_) => {
                         out.clear();
-                        match reg_read(bus, sensor::REG_ALS).await {
-                            Ok(a) => {
+                        let mut sensor = Veml7700::new(&mut *bus);
+                        let mut delay = Delay;
+                        match sensor.measure_once(&mut delay, MEASUREMENT_CONFIG).await {
+                            Ok(measurement) => {
                                 let _ = write!(
                                     out,
-                                    "als={:5}  ~{} lux\r\n",
-                                    a,
-                                    (a as f32 * sensor::RESOLUTION) as u32
+                                    "als={:5} nominal={} mLux\r\n",
+                                    measurement.als.counts(),
+                                    measurement.nominal_illuminance.milli_lux_rounded()
                                 );
                             }
                             Err(_) => {
