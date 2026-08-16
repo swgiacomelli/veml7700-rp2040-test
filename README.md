@@ -5,9 +5,6 @@ light sensor. It exposes a USB CDC serial console, uses I2C0 on GP4 (SDA) and
 GP5 (SCL), and accesses the sensor through the async
 [`ph-veml7700-als`](https://github.com/photon-circus/ph-veml7700-als) driver.
 
-The unpublished driver dependency is pinned to an exact Git revision. Building
-therefore requires GitHub credentials with access to the private repository.
-
 ## Wiring
 
 | RP2040 | VEML7700 |

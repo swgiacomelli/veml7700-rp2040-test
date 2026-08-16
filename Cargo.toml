@@ -17,7 +17,7 @@ embassy-usb = "0.4"
 embassy-futures = "0.1"
 embassy-sync = "0.6"
 embedded-hal-async = "1.0"
-ph-veml7700-als = { git = "https://github.com/photon-circus/ph-veml7700-als", rev = "6996c2ff3151f1cff436177c140739cad11a4b31" }
+ph-veml7700-als = "0.1.0-incubating.1"
 
 cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
