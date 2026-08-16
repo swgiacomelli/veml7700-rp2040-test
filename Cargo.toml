@@ -1,0 +1,36 @@
+[package]
+name = "veml7700-console"
+version = "0.1.0"
+edition = "2024"
+description = "RP2040 USB console for VEML7700 sensor bring-up"
+license = "MIT"
+publish = false
+
+# Versions churn fast in the embassy ecosystem — check crates.io / the embassy
+# repo before pinning. If you already run a workspace on git revs, point these
+# at the same rev rather than crates.io.
+[dependencies]
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "executor-interrupt"] }
+embassy-rp = { version = "0.4", features = ["rp2040", "time-driver", "critical-section-impl"] }
+embassy-time = "0.4"
+embassy-usb = "0.4"
+embassy-futures = "0.1"
+embassy-sync = "0.6"
+embedded-hal-async = "1.0"
+
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+panic-halt = "1.0"
+
+heapless = "0.8"
+portable-atomic = { version = "1", features = ["critical-section"] }
+static_cell = "2.1"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+debug = 2          # symbols cost nothing in flash, keep them for probe-rs
+overflow-checks = true
+
+[profile.dev]
+opt-level = 1      # embassy + USB is unusably slow at opt-level 0
