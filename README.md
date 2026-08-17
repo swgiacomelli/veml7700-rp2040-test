@@ -45,3 +45,18 @@ Connect to the USB CDC serial port and enter `help` to list the console
 commands. The `read` and `stream` commands perform controlled one-shot captures
 using the driver's maximum-range starting configuration and report its nominal
 integer illuminance in millilux.
+
+## Recording hardware evidence
+
+Run `evidence` before any command that configures the sensor, ideally immediately
+after a complete sensor power cycle. It prints the known firmware-side setup and
+the raw little-endian bytes and word for registers `0x00` through `0x07`. The
+command deliberately bypasses typed register decoding so unexpected reserved
+bits remain visible. It writes no register values, although register reads may
+still have undocumented device-side effects.
+
+The output is useful only when accompanied by the physical setup, conditions,
+procedure, and original serial log. Use [HARDWARE_EVIDENCE.md](HARDWARE_EVIDENCE.md)
+as the record and experiment guide. In particular, the firmware cannot determine
+the exact RP2040 board revision, sensor breakout and silicon markings, rail
+voltage, pull-up resistance, wiring geometry, temperature, or optical reference.

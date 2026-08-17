@@ -9,6 +9,7 @@
 //! Console commands (CR or LF terminated):
 //!   help          list commands
 //!   scan          probe every 7-bit address, list responders
+//!   evidence      print setup metadata and raw registers without configuring the sensor
 //!   id            read the VEML7700 ID register (0x07)
 //!   conf          read back ALS_CONF
 //!   read          one ALS + WHITE raw sample
@@ -38,6 +39,8 @@ bind_interrupts!(struct Irqs {
 });
 
 const MEASUREMENT_CONFIG: MeasurementConfig = MeasurementConfig::maximum_range_start();
+const VEML7700_ADDRESS: u8 = 0x10;
+const I2C_FREQUENCY_HZ: u32 = 100_000;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -46,7 +49,7 @@ async fn main(spawner: Spawner) {
     // ---- I2C0: GP4 = SDA, GP5 = SCL. 100 kHz for perfboard bring-up.
     // Note embassy-rp takes SCL first.
     let mut cfg = i2c::Config::default();
-    cfg.frequency = 100_000;
+    cfg.frequency = I2C_FREQUENCY_HZ;
     let mut bus = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, cfg);
 
     // ---- USB CDC-ACM.
@@ -151,7 +154,11 @@ async fn dispatch(
     match cmd {
         "" => {}
         "help" => {
-            write_str(class, "help | scan | id | conf | read | stream\r\n").await?;
+            write_str(
+                class,
+                "help | scan | evidence | id | conf | read | stream\r\n",
+            )
+            .await?;
         }
         "scan" => {
             let mut probe = [0u8; 1];
@@ -163,6 +170,48 @@ async fn dispatch(
                 }
             }
             write_str(class, "scan done\r\n").await?;
+        }
+        "evidence" => {
+            // Read raw words directly so observations of undocumented/reserved
+            // bits are not lost to the driver's typed decoders. This command
+            // writes no register values, but selecting/reading a register could
+            // still have an undocumented device-side effect.
+            write_str(class, "BEGIN VEML7700_EVIDENCE v1\r\n").await?;
+            write_str(
+                class,
+                "mcu=RP2040\r\ni2c_controller=I2C0\r\nsda=GP4\r\nscl=GP5\r\n",
+            )
+            .await?;
+            out.clear();
+            let _ = write!(
+                out,
+                "i2c_frequency_hz={}\r\ni2c_address_7bit=0x{:02x}\r\n",
+                I2C_FREQUENCY_HZ, VEML7700_ADDRESS
+            );
+            write_str(class, &out).await?;
+
+            for register in 0x00u8..=0x07 {
+                let mut bytes = [0u8; 2];
+                out.clear();
+                match bus
+                    .write_read(VEML7700_ADDRESS, &[register], &mut bytes)
+                    .await
+                {
+                    Ok(()) => {
+                        let raw = u16::from_le_bytes(bytes);
+                        let _ = write!(
+                            out,
+                            "register=0x{:02x},lsb=0x{:02x},msb=0x{:02x},word=0x{:04x}\r\n",
+                            register, bytes[0], bytes[1], raw
+                        );
+                    }
+                    Err(_) => {
+                        let _ = write!(out, "register=0x{:02x},error=i2c\r\n", register);
+                    }
+                }
+                write_str(class, &out).await?;
+            }
+            write_str(class, "END VEML7700_EVIDENCE\r\n").await?;
         }
         "id" => {
             let mut sensor = Veml7700::new(&mut *bus);
