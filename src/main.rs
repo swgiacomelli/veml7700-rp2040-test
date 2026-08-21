@@ -15,32 +15,37 @@
 //!   read          one ALS + WHITE raw sample
 //!   stream        continuous ALS samples until any key is pressed
 
-use core::fmt::Write as _;
+mod commands; // this firmware
+mod console; // copy this directory into a new app as `mod console;`
 
+use commands::{BoardInfo, VemlApp};
+use console::usb::{self, CdcAcmDevice};
+use console::{CdcAcmTransport, Console, match_commands};
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
 use embassy_rp::bind_interrupts;
-use embassy_rp::i2c::{self, Async, I2c};
+use embassy_rp::i2c::{self, I2c};
 use embassy_rp::peripherals::{I2C0, USB};
-use embassy_rp::usb::{Driver, InterruptHandler as UsbIrq};
-use embassy_time::{Delay, Duration, Timer};
-use embassy_usb::Builder;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
-use embassy_usb::driver::EndpointError;
-use embedded_hal_async::i2c::I2c as _;
-use heapless::String;
+use embassy_rp::usb::InterruptHandler as UsbIrq;
 use panic_halt as _;
-use ph_veml7700_als::{MeasurementConfig, Veml7700};
-use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
     I2C0_IRQ => i2c::InterruptHandler<I2C0>;
     USBCTRL_IRQ => UsbIrq<USB>;
 });
 
-const MEASUREMENT_CONFIG: MeasurementConfig = MeasurementConfig::maximum_range_start();
 const VEML7700_ADDRESS: u8 = 0x10;
 const I2C_FREQUENCY_HZ: u32 = 100_000;
+
+match_commands! {
+    <I2C: embedded_hal_async::i2c::I2c> for VemlApp<'_, I2C> {
+        "scan", "probe every 7-bit address, list responders" => cmd_scan,
+        "evidence", "print setup metadata and raw registers without configuring the sensor" => cmd_evidence,
+        "id", "read the VEML7700 ID register (0x07)" => cmd_id,
+        "conf", "read back ALS_CONF" => cmd_conf,
+        "read", "one ALS + WHITE raw sample" => cmd_read,
+        "stream", "continuous ALS samples until any key is pressed" => cmd_stream,
+    }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -53,7 +58,6 @@ async fn main(spawner: Spawner) {
     let mut bus = I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, cfg);
 
     // ---- USB CDC-ACM.
-    let driver = Driver::new(p.USB, Irqs);
     let mut usb_cfg = embassy_usb::Config::new(0xc0de, 0xcafe);
     usb_cfg.manufacturer = Some("photon-circus");
     usb_cfg.product = Some("veml7700-console");
@@ -61,247 +65,25 @@ async fn main(spawner: Spawner) {
     usb_cfg.max_power = 100;
     usb_cfg.max_packet_size_0 = 64;
 
-    static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
-    static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
-    static CTRL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-    static CDC_STATE: StaticCell<State> = StaticCell::new();
+    let CdcAcmDevice { class, usb } = usb::new(p.USB, Irqs, usb_cfg);
+    spawner.must_spawn(usb::usb_task(usb));
 
-    let mut builder = Builder::new(
-        driver,
-        usb_cfg,
-        CONFIG_DESC.init([0; 256]),
-        BOS_DESC.init([0; 256]),
-        &mut [], // no msos descriptors
-        CTRL_BUF.init([0; 64]),
+    let mut transport = CdcAcmTransport::new(class);
+    let mut app = VemlApp::new(
+        &mut bus,
+        BoardInfo {
+            mcu: "RP2040",
+            i2c_controller: "I2C0",
+            sda: "GP4",
+            scl: "GP5",
+            i2c_frequency_hz: I2C_FREQUENCY_HZ,
+            i2c_address_7bit: VEML7700_ADDRESS,
+        },
     );
-
-    let mut class = CdcAcmClass::new(&mut builder, CDC_STATE.init(State::new()), 64);
-    let usb = builder.build();
-    spawner.must_spawn(usb_task(usb));
+    let console = Console::new("veml7700 console. type 'help'.", "> ");
 
     loop {
-        class.wait_connection().await;
-        let _ = console(&mut class, &mut bus).await;
+        transport.wait_connection().await;
+        let _ = console.run(&mut transport, &mut app).await;
     }
-}
-
-#[embassy_executor::task]
-async fn usb_task(mut usb: embassy_usb::UsbDevice<'static, Driver<'static, USB>>) -> ! {
-    usb.run().await
-}
-
-// ---------------------------------------------------------------------------
-// Console
-// ---------------------------------------------------------------------------
-
-type Cdc = CdcAcmClass<'static, Driver<'static, USB>>;
-
-async fn write_str(class: &mut Cdc, s: &str) -> Result<(), EndpointError> {
-    // CDC max packet is 64 bytes; chunk and avoid a zero-length terminator.
-    for chunk in s.as_bytes().chunks(63) {
-        class.write_packet(chunk).await?;
-    }
-    Ok(())
-}
-
-async fn console(
-    class: &mut Cdc,
-    bus: &mut I2c<'static, I2C0, Async>,
-) -> Result<(), EndpointError> {
-    write_str(class, "\r\nveml7700 console. type 'help'.\r\n> ").await?;
-
-    let mut line: [u8; 64] = [0; 64];
-    let mut len = 0usize;
-    let mut packet = [0u8; 64];
-
-    loop {
-        let n = class.read_packet(&mut packet).await?;
-        for &b in &packet[..n] {
-            match b {
-                b'\r' | b'\n' => {
-                    write_str(class, "\r\n").await?;
-                    let cmd = core::str::from_utf8(&line[..len]).unwrap_or("");
-                    dispatch(class, bus, cmd.trim()).await?;
-                    len = 0;
-                    write_str(class, "> ").await?;
-                }
-                0x08 | 0x7f => {
-                    if len > 0 {
-                        len -= 1;
-                        write_str(class, "\x08 \x08").await?;
-                    }
-                }
-                0x20..=0x7e => {
-                    if len < line.len() {
-                        line[len] = b;
-                        len += 1;
-                        class.write_packet(&[b]).await?; // local echo
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-async fn dispatch(
-    class: &mut Cdc,
-    bus: &mut I2c<'static, I2C0, Async>,
-    cmd: &str,
-) -> Result<(), EndpointError> {
-    let mut out: String<192> = String::new();
-
-    match cmd {
-        "" => {}
-        "help" => {
-            write_str(
-                class,
-                "help | scan | evidence | id | conf | read | stream\r\n",
-            )
-            .await?;
-        }
-        "scan" => {
-            let mut probe = [0u8; 1];
-            for addr in 0x08u8..0x78 {
-                if bus.read(addr, &mut probe).await.is_ok() {
-                    out.clear();
-                    let _ = write!(out, "  found 0x{:02x}\r\n", addr);
-                    write_str(class, &out).await?;
-                }
-            }
-            write_str(class, "scan done\r\n").await?;
-        }
-        "evidence" => {
-            // Read raw words directly so observations of undocumented/reserved
-            // bits are not lost to the driver's typed decoders. This command
-            // writes no register values, but selecting/reading a register could
-            // still have an undocumented device-side effect.
-            write_str(class, "BEGIN VEML7700_EVIDENCE v1\r\n").await?;
-            write_str(
-                class,
-                "mcu=RP2040\r\ni2c_controller=I2C0\r\nsda=GP4\r\nscl=GP5\r\n",
-            )
-            .await?;
-            out.clear();
-            let _ = write!(
-                out,
-                "i2c_frequency_hz={}\r\ni2c_address_7bit=0x{:02x}\r\n",
-                I2C_FREQUENCY_HZ, VEML7700_ADDRESS
-            );
-            write_str(class, &out).await?;
-
-            for register in 0x00u8..=0x07 {
-                let mut bytes = [0u8; 2];
-                out.clear();
-                match bus
-                    .write_read(VEML7700_ADDRESS, &[register], &mut bytes)
-                    .await
-                {
-                    Ok(()) => {
-                        let raw = u16::from_le_bytes(bytes);
-                        let _ = write!(
-                            out,
-                            "register=0x{:02x},lsb=0x{:02x},msb=0x{:02x},word=0x{:04x}\r\n",
-                            register, bytes[0], bytes[1], raw
-                        );
-                    }
-                    Err(_) => {
-                        let _ = write!(out, "register=0x{:02x},error=i2c\r\n", register);
-                    }
-                }
-                write_str(class, &out).await?;
-            }
-            write_str(class, "END VEML7700_EVIDENCE\r\n").await?;
-        }
-        "id" => {
-            let mut sensor = Veml7700::new(&mut *bus);
-            match sensor.read_device_id().await {
-                Ok(id) => {
-                    let _ = write!(
-                        out,
-                        "id=0x{:04x} device_code=0x{:02x} supported={}\r\n",
-                        id.raw(),
-                        id.device_code(),
-                        id.is_supported()
-                    );
-                }
-                Err(_) => {
-                    let _ = write!(out, "i2c error reading id\r\n");
-                }
-            }
-            write_str(class, &out).await?;
-        }
-        "conf" => {
-            let mut sensor = Veml7700::new(&mut *bus);
-            match sensor.read_configuration().await {
-                Ok(config) => {
-                    let _ = write!(
-                        out,
-                        "gain={:?} integration={}ms power={:?} monitor={:?}\r\n",
-                        config.measurement.gain(),
-                        config.measurement.integration_time().milliseconds(),
-                        config.power_state,
-                        config.threshold_monitor
-                    );
-                }
-                Err(_) => {
-                    let _ = write!(out, "i2c error reading conf\r\n");
-                }
-            }
-            write_str(class, &out).await?;
-        }
-        "read" => {
-            let mut sensor = Veml7700::new(&mut *bus);
-            let mut delay = Delay;
-            match sensor.measure_once(&mut delay, MEASUREMENT_CONFIG).await {
-                Ok(measurement) => {
-                    let _ = write!(
-                        out,
-                        "als={:5} white={:5} nominal={} mLux\r\n",
-                        measurement.als.counts(),
-                        measurement.white.counts(),
-                        measurement.nominal_illuminance.milli_lux_rounded()
-                    );
-                }
-                _ => {
-                    let _ = write!(out, "i2c error\r\n");
-                }
-            }
-            write_str(class, &out).await?;
-        }
-        "stream" => {
-            write_str(class, "streaming — press any key to stop\r\n").await?;
-            let mut sink = [0u8; 64];
-            loop {
-                let tick = Timer::after(Duration::from_millis(250));
-                match select(tick, class.read_packet(&mut sink)).await {
-                    Either::First(_) => {
-                        out.clear();
-                        let mut sensor = Veml7700::new(&mut *bus);
-                        let mut delay = Delay;
-                        match sensor.measure_once(&mut delay, MEASUREMENT_CONFIG).await {
-                            Ok(measurement) => {
-                                let _ = write!(
-                                    out,
-                                    "als={:5} nominal={} mLux\r\n",
-                                    measurement.als.counts(),
-                                    measurement.nominal_illuminance.milli_lux_rounded()
-                                );
-                            }
-                            Err(_) => {
-                                let _ = write!(out, "i2c error\r\n");
-                            }
-                        }
-                        write_str(class, &out).await?;
-                    }
-                    Either::Second(_) => break,
-                }
-            }
-        }
-        other => {
-            let _ = write!(out, "unknown: {}\r\n", other);
-            write_str(class, &out).await?;
-        }
-    }
-    Ok(())
 }
